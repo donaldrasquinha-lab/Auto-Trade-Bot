@@ -45,7 +45,44 @@ OI_PERCENTILE   = 70
 TOP_N_STRIKES   = 10
 HISTORY_LEN     = 15
 MONITOR_SECS    = 300
-GEAR_PTS        = {4: 200, 3: 150, 2: 100, 1: 50}
+
+# ─────────────────────────────────────────────
+# PER-INDEX DI SCENARIO TARGET TABLE
+# ─────────────────────────────────────────────
+# Two scenarios per index:
+#   "crossover" → +DI just crossed -DI (moderate, use immediate-move midpoint)
+#   "strong"    → DI value > 25        (strong trend, use trend-potential midpoint)
+#
+# Values are midpoints of the ranges from the DI Scenario table.
+# immediate  = midpoint of "Approx. Immediate Move"
+# trend      = midpoint of "Approx. Trend Potential"
+# sl_ratio   = SL as fraction of target (50%)
+#
+INDEX_TARGETS = {
+    "Nifty 50": {
+        "crossover": {"immediate": 60,   "trend": 150,  "label": "+DI cross"},
+        "strong":    {"immediate": 100,  "trend": 325,  "label": "DI > 25"},
+    },
+    "Nifty Bank": {
+        "crossover": {"immediate": 200,  "trend": 500,  "label": "+DI cross"},
+        "strong":    {"immediate": 375,  "trend": 1000, "label": "DI > 25"},
+    },
+    "Nifty Fin Svc": {
+        "crossover": {"immediate": 95,   "trend": 240,  "label": "+DI cross"},
+        "strong":    {"immediate": 180,  "trend": 475,  "label": "DI > 25"},
+    },
+    "Nifty Midcap 50": {
+        "crossover": {"immediate": 60,   "trend": 150,  "label": "+DI cross"},
+        "strong":    {"immediate": 100,  "trend": 325,  "label": "DI > 25"},
+    },
+    "Sensex": {
+        "crossover": {"immediate": 275,  "trend": 800,  "label": "+DI cross"},
+        "strong":    {"immediate": 500,  "trend": 1600, "label": "DI > 25"},
+    },
+}
+
+# Legacy fallback (used only for display gear bars — kept for backward compat)
+GEAR_PTS = {4: 200, 3: 150, 2: 100, 1: 50}
 
 # ── Option selection scoring weights (must sum to 100) ──
 W_ADX       = 30   # option's own trend strength
@@ -120,6 +157,7 @@ def _init():
         sv_mock_banner  = False,
         sv_cpr          = None,
         sv_entry_sig    = None,
+        sv_di_targets   = None,
 
     )
     for k, v in defaults.items():
@@ -153,7 +191,59 @@ def ts():
     return pd.Timestamp.now(tz="Asia/Kolkata").strftime("%H:%M:%S")
 
 def gear(adx):
+    """Legacy gear for visual gear-bar display only."""
     return 4 if adx >= 40 else 3 if adx >= 35 else 2 if adx >= 30 else 1
+
+
+def get_di_targets(index_name: str, dmi: dict) -> dict:
+    """
+    Returns target dictionary for the current index and DI scenario.
+
+    Scenario selection:
+      "strong"    → both DI values computed and dominant DI >= 25
+      "crossover" → +DI recently crossed -DI (ADX >= 20, dominant DI < 25)
+      fallback    → Nifty 50 crossover defaults
+
+    Returns:
+      {
+        "scenario":  "strong" | "crossover",
+        "label":     display label,
+        "immediate": point target (immediate move midpoint),
+        "trend":     point target (trend potential midpoint),
+        "target":    active target in use (immediate when ADX<30 else trend),
+        "sl":        stop loss points (50% of target),
+        "adx":       current ADX,
+        "pdi":       current +DI,
+        "ndi":       current -DI,
+      }
+    """
+    idx_tbl = INDEX_TARGETS.get(index_name, INDEX_TARGETS["Nifty 50"])
+    pdi     = dmi.get("pdi", 0)
+    ndi     = dmi.get("ndi", 0)
+    adx     = dmi.get("adx", 0)
+
+    dominant_di = max(pdi, ndi)
+
+    # Scenario: "strong" if dominant DI >= 25, else "crossover"
+    scenario = "strong" if dominant_di >= 25 else "crossover"
+    tbl      = idx_tbl[scenario]
+
+    # Use trend target when trend is well established (ADX >= 30)
+    # Use immediate target when ADX is building (ADX < 30)
+    target = tbl["trend"] if adx >= 30 else tbl["immediate"]
+    sl     = round(target * 0.50)
+
+    return {
+        "scenario":  scenario,
+        "label":     tbl["label"],
+        "immediate": tbl["immediate"],
+        "trend":     tbl["trend"],
+        "target":    target,
+        "sl":        sl,
+        "adx":       adx,
+        "pdi":       pdi,
+        "ndi":       ndi,
+    }
 
 def ha(d):
     return float(np.mean(list(d))) if d else 0.0
@@ -959,8 +1049,9 @@ def _fetch_data():
     st.session_state.sv_bullish   = bullish
     st.session_state.sv_oi_chg    = oi_chg
     st.session_state.sv_now_ts    = now_ts
-    st.session_state.sv_cpr       = cpr
-    st.session_state.sv_entry_sig = entry_sig
+    st.session_state.sv_cpr        = cpr
+    st.session_state.sv_entry_sig  = entry_sig
+    st.session_state.sv_di_targets = get_di_targets(selected, dmi)
 
 @st.fragment(run_every=5)
 def _frag_index():
@@ -984,7 +1075,9 @@ def _frag_index():
     st.session_state.last_signal = sig
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("LTP",       f"₹{live_px:,.2f}")
-    c2.metric("ADX",       f"{dmi['adx']:.2f}", f"Gear {idx_g} → +{GEAR_PTS[idx_g]} pts")
+    _di_t = st.session_state.get("sv_di_targets") or get_di_targets(selected, dmi)
+    c2.metric("ADX", f"{dmi['adx']:.2f}",
+              f"{_di_t['label']} → target {_di_t['target']} pts")
     c3.metric("+DI / -DI", f"{dmi['pdi']:.2f} / {dmi['ndi']:.2f}")
     c4.metric("Signal",    sig)
 
@@ -993,14 +1086,15 @@ def _frag_buy_trade():
     if "sv_best_opt" not in st.session_state:
         st.caption("Loading option data…")
         return
-    best_opt = st.session_state.sv_best_opt
-    dmi      = st.session_state.sv_dmi
-    score    = st.session_state.sv_score
-    opt_g    = st.session_state.sv_opt_g
-    oi_chg   = st.session_state.sv_oi_chg
-    bullish  = st.session_state.sv_bullish
-    now_ts   = st.session_state.sv_now_ts
-    checks   = st.session_state.sv_checks
+    best_opt   = st.session_state.sv_best_opt
+    dmi        = st.session_state.sv_dmi
+    score      = st.session_state.sv_score
+    opt_g      = st.session_state.sv_opt_g
+    oi_chg     = st.session_state.sv_oi_chg
+    bullish    = st.session_state.sv_bullish
+    now_ts     = st.session_state.sv_now_ts
+    checks     = st.session_state.sv_checks
+    di_tgt     = st.session_state.get("sv_di_targets") or get_di_targets(selected, dmi)
     st.divider()
 
     # Best option buy box
@@ -1150,6 +1244,46 @@ def _frag_buy_trade():
 
     st.divider()
 
+    # ── DI SCENARIO TARGET CARD ──────────────────
+    _dt = di_tgt
+    _dt_col  = "#27500A" if _dt["scenario"] == "strong" else "#185FA5"
+    _dt_bg   = "#EAF3DE" if _dt["scenario"] == "strong" else "#E6F1FB"
+    _dt_bdr  = "#3B6D11" if _dt["scenario"] == "strong" else "#185FA5"
+    st.markdown(f"""
+<div style="border:1.5px solid {_dt_bdr};border-radius:10px;
+            background:{_dt_bg};padding:11px 16px;margin-bottom:12px">
+  <div style="font-size:10px;font-weight:500;color:{_dt_col};
+              letter-spacing:.06em;margin-bottom:6px">
+    DI SCENARIO — {selected.upper()}
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px">
+    <div>
+      <div style="font-size:10px;color:{_dt_col};opacity:.7">Scenario</div>
+      <div style="font-size:14px;font-weight:500;color:{_dt_col}">{_dt["label"]}</div>
+    </div>
+    <div>
+      <div style="font-size:10px;color:{_dt_col};opacity:.7">Active target</div>
+      <div style="font-size:18px;font-weight:500;color:{_dt_col}">{_dt["target"]} pts</div>
+    </div>
+    <div>
+      <div style="font-size:10px;color:{_dt_col};opacity:.7">Immediate move</div>
+      <div style="font-size:14px;font-weight:500;color:{_dt_col}">{_dt["immediate"]} pts</div>
+    </div>
+    <div>
+      <div style="font-size:10px;color:{_dt_col};opacity:.7">Trend potential</div>
+      <div style="font-size:14px;font-weight:500;color:{_dt_col}">{_dt["trend"]} pts</div>
+    </div>
+  </div>
+  <div style="display:flex;gap:16px;margin-top:8px;font-size:11px;color:{_dt_col};opacity:.8">
+    <span>ADX {_dt["adx"]:.1f}</span>
+    <span>+DI {_dt["pdi"]:.1f}</span>
+    <span>-DI {_dt["ndi"]:.1f}</span>
+    <span>SL = {_dt["sl"]} pts (50% of target)</span>
+    <span>{"Using trend target — ADX ≥ 30" if _dt["adx"] >= 30 else "Using immediate target — ADX building"}</span>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
     # ── MOCKUP TRADE CONTROL ──────────────────────
     # Rules:
     #   SL  = entry_ltp − (target_pts × 0.50)   ← fixed, ~50% of target
@@ -1215,8 +1349,9 @@ def _frag_buy_trade():
             else:
                 _opt = best_opt
                 _opt = {**_opt, "side": _trade_side}
-            _tgt   = GEAR_PTS[opt_g]
-            _sl_pt = round(_tgt * 0.50, 2)           # SL = 50% of target pts
+            # Use per-index DI-scenario target (overrides generic GEAR_PTS)
+            _tgt   = di_tgt["target"]
+            _sl_pt = di_tgt["sl"]   # pre-computed as 50% of target
             st.session_state.trade_active  = True
             st.session_state.trade_mode    = "mockup"
             st.session_state.entry_price   = _opt["ltp"]
@@ -1538,8 +1673,10 @@ def _frag_orders():
             st.markdown("**Step 2 — Set quantity, target & trailing SL**")
             col_q, col_t, col_tsl = st.columns(3)
             lo_qty_val    = col_q.number_input("Lots", min_value=1, max_value=50, value=1, step=1)
-            lo_target_val = col_t.number_input("Target (pts)", min_value=10, max_value=500,
-                                                value=GEAR_PTS[opt_g], step=10)
+            _live_di_tgt = st.session_state.get("sv_di_targets")
+            _live_default = _live_di_tgt["target"] if _live_di_tgt else GEAR_PTS[opt_g]
+            lo_target_val = col_t.number_input("Target (pts)", min_value=10, max_value=2000,
+                                                value=_live_default, step=10)
             lo_tsl_val    = col_tsl.number_input("Trailing SL (%)", min_value=5.0, max_value=80.0,
                                                   value=30.0, step=5.0)
 
